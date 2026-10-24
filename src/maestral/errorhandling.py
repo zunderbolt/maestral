@@ -372,7 +372,9 @@ def dropbox_to_maestral_error(
                 text = "Data corruption during upload. Please try again."
                 err_cls = DataCorruptionError
 
-        elif isinstance(error, files.UploadSessionLookupError):
+        elif isinstance(
+            error, (files.UploadSessionLookupError, files.UploadSessionAppendError)
+        ):
             title = "Could not upload file"
             text, err_cls = get_session_lookup_error_msg(error)
 
@@ -713,7 +715,9 @@ def get_lookup_error_msg(
 
 
 def get_session_lookup_error_msg(
-    session_lookup_error: files.UploadSessionLookupError,
+    session_lookup_error: (
+        files.UploadSessionLookupError | files.UploadSessionAppendError
+    ),
 ) -> tuple[str, type[SyncError]]:
     err_cls = SyncError
 
@@ -722,7 +726,10 @@ def get_session_lookup_error_msg(
     elif session_lookup_error.is_incorrect_offset():
         text = "A network error occurred during the upload session."
         err_cls = DataCorruptionError
-    elif session_lookup_error.is_not_closed():
+    elif (
+        isinstance(session_lookup_error, files.UploadSessionLookupError)
+        and session_lookup_error.is_not_closed()
+    ):
         text = "Upload session is still open, cannot finish."
     elif session_lookup_error.is_not_found():
         text = (

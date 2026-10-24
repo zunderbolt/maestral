@@ -181,6 +181,11 @@ def test_get_session_lookup_error_msg(error, maestral_exc):
         (UploadSessionFinishError.other, MaestralApiError),
         (UploadSessionLookupError.too_large, FileSizeError),
         (UploadSessionLookupError.other, MaestralApiError),
+        (UploadSessionAppendError.content_hash_mismatch, DataCorruptionError),
+        (
+            UploadSessionAppendError.incorrect_offset(UploadSessionOffsetError(20)),
+            DataCorruptionError,
+        ),
         (DownloadError.path(LookupError.not_found), NotFoundError),
         (DownloadError.unsupported_file, UnsupportedFileError),
         (DownloadError.other, MaestralApiError),
