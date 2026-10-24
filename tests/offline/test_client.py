@@ -1,14 +1,16 @@
 from datetime import datetime, timezone
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import requests
-from dropbox import common, files, sharing, team_common, users, users_common
+from dropbox import Dropbox, common, files, sharing, team_common, users, users_common
+from dropbox.dropbox_client import RouteResult
 from dropbox.oauth import DropboxOAuth2FlowNoRedirect
 
 from maestral import core
 from maestral.client import (
     DropboxClient,
+    _DropboxSDK,
     convert_account,
     convert_full_account,
     convert_metadata,
@@ -17,6 +19,28 @@ from maestral.client import (
 )
 from maestral.exceptions import NotLinkedError
 from maestral.keyring import CredentialStorage
+
+UPLOAD_ARG = b'{"path": "/file.txt"}'
+
+FILE_METADATA_JSON = b"""{
+    "name": "file.txt",
+    "id": "id:0123456789",
+    "client_modified": "2024-01-01T00:00:00Z",
+    "server_modified": "2024-01-01T00:00:00Z",
+    "rev": "0123456789abcdef",
+    "size": 10,
+    "path_lower": "/file.txt",
+    "path_display": "/file.txt"
+}"""
+
+
+def _response(content: bytes = b"{}") -> requests.Response:
+    res = requests.Response()
+    res.status_code = 200
+    res.headers["Content-Type"] = "application/json"
+    res._content = content
+    return res
+
 
 # ==== DropboxClient tests =============================================================
 
@@ -88,6 +112,196 @@ def test_unlink_error():
 
     with pytest.raises(NotLinkedError):
         client.unlink()
+
+
+def test_upload_chunked(tmp_path):
+    session = Mock(spec=requests.Session)
+    cred_storage = Mock(spec_set=CredentialStorage, token=None)
+    client = DropboxClient("test-config", cred_storage, session=session)
+    client._init_sdk(access_token="token")
+    client.UPLOAD_REQUEST_CHUNK_SIZE = 4
+    client.upload_chunk_size = 2
+
+    requests_sent = []
+
+    def post(url, headers, data, **kwargs):
+        route = url.split("/2/", 1)[1]
+        requests_sent.append((route, list(data)))
+        if route == "files/upload_session/start":
+            return _response(b'{"session_id": "session-id"}')
+        elif route == "files/upload_session/append_v2":
+            return _response(b"null")
+        else:
+            return _response(FILE_METADATA_JSON)
+
+    session.post.side_effect = post
+
+    local_path = tmp_path / "file.txt"
+    local_path.write_bytes(b"0123456789")
+
+    md = client.upload(str(local_path), "/file.txt")
+
+    assert md.path_display == "/file.txt"
+    assert requests_sent == [
+        ("files/upload_session/start", [b"01", b"23"]),
+        ("files/upload_session/append_v2", [b"45", b"67"]),
+        ("files/upload_session/finish", [b"89"]),
+    ]
+
+
+# ==== Dropbox SDK subclass tests ======================================================
+
+
+def _sdk(**kwargs) -> _DropboxSDK:
+    session = Mock(spec=requests.Session)
+    session.post.return_value = _response()
+    return _DropboxSDK(oauth2_access_token="token", session=session, **kwargs)
+
+
+def test_sdk_rpc_without_extra_headers():
+    sdk = _sdk()
+
+    with patch.object(Dropbox, "request_json_string", autospec=True) as parent:
+        sdk.request_json_string("api", "files/get_metadata", "rpc", b"{}", "user", None)
+
+    parent.assert_called_once_with(
+        sdk,
+        "api",
+        "files/get_metadata",
+        "rpc",
+        b"{}",
+        "user",
+        None,
+        None,
+        extra_headers=None,
+    )
+
+
+def test_sdk_rpc_forwards_extra_headers():
+    sdk = _sdk()
+    extra_headers = {"X-Custom": "value"}
+
+    with patch.object(Dropbox, "request_json_string", autospec=True) as parent:
+        sdk.request_json_string(
+            "api",
+            "files/get_metadata",
+            "rpc",
+            b"{}",
+            "user",
+            None,
+            extra_headers=extra_headers,
+        )
+
+    parent.assert_called_once_with(
+        sdk,
+        "api",
+        "files/get_metadata",
+        "rpc",
+        b"{}",
+        "user",
+        None,
+        None,
+        extra_headers=extra_headers,
+    )
+
+
+def test_sdk_route_call():
+    # Calls through the SDK's retry wrapper, which passes ``extra_headers`` on.
+    sdk = _sdk()
+    sdk._session.post.return_value = _response(
+        b'{"used": 10, "allocation": {".tag": "individual", "allocated": 20}}'
+    )
+
+    space_usage = sdk.users_get_space_usage()
+
+    assert space_usage.used == 10
+    headers = sdk._session.post.call_args.kwargs["headers"]
+    assert headers["Authorization"] == "Bearer token"
+
+
+def test_sdk_upload():
+    sdk = _sdk()
+
+    res = sdk.request_json_string(
+        "content", "files/upload", "upload", UPLOAD_ARG, "user", b"data"
+    )
+
+    assert isinstance(res, RouteResult)
+    sdk._session.post.assert_called_once_with(
+        "https://content.dropboxapi.com/2/files/upload",
+        headers={
+            "User-Agent": sdk._user_agent,
+            "Authorization": "Bearer token",
+            "Content-Type": "application/octet-stream",
+            "Dropbox-API-Arg": UPLOAD_ARG,
+        },
+        data=b"data",
+        stream=False,
+        verify=True,
+        timeout=sdk._timeout,
+    )
+
+
+def test_sdk_upload_extra_headers():
+    sdk = _sdk(headers={"X-Sdk": "sdk", "X-Shared": "sdk"})
+
+    sdk.request_json_string(
+        "content",
+        "files/upload",
+        "upload",
+        UPLOAD_ARG,
+        "user",
+        b"data",
+        timeout=10,
+        extra_headers={"X-Custom": "value", "X-Shared": "extra"},
+    )
+
+    kwargs = sdk._session.post.call_args.kwargs
+    assert kwargs["headers"] == {
+        "User-Agent": sdk._user_agent,
+        "X-Sdk": "sdk",
+        "X-Shared": "extra",
+        "X-Custom": "value",
+        "Authorization": "Bearer token",
+        "Content-Type": "application/octet-stream",
+        "Dropbox-API-Arg": UPLOAD_ARG,
+    }
+    assert kwargs["data"] == b"data"
+    assert kwargs["timeout"] == 10
+
+
+def test_sdk_upload_auth_header_precedence():
+    sdk = _sdk(headers={"Authorization": "Bearer sdk"})
+
+    sdk.request_json_string(
+        "content",
+        "files/upload",
+        "upload",
+        UPLOAD_ARG,
+        "user",
+        b"data",
+        extra_headers={
+            "Authorization": "Bearer extra",
+            "Content-Type": "text/plain",
+            "Dropbox-API-Arg": "{}",
+        },
+    )
+
+    headers = sdk._session.post.call_args.kwargs["headers"]
+    assert headers["Authorization"] == "Bearer token"
+    assert headers["Content-Type"] == "application/octet-stream"
+    assert headers["Dropbox-API-Arg"] == UPLOAD_ARG
+
+
+def test_sdk_upload_streamed():
+    sdk = _sdk()
+    sdk._session.post.return_value = _response(FILE_METADATA_JSON)
+    body = iter([b"01234", b"56789"])
+
+    md = sdk.files_upload(body, "/file.txt")
+
+    assert md.path_display == "/file.txt"
+    assert sdk._session.post.call_args.kwargs["data"] is body
 
 
 # ==== type conversion tests ===========================================================
