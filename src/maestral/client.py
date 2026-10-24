@@ -114,6 +114,7 @@ class _DropboxSDK(Dropbox):
         auth_type: str,
         request_binary: bytes | Iterator[bytes] | None,
         timeout: float | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> RouteResult | RouteErrorResult:
         # Custom handling to allow for streamed and chunked uploads. This is mostly
         # reproduced from the parent function but without limiting the request body
@@ -127,14 +128,16 @@ class _DropboxSDK(Dropbox):
             if USER_AUTH not in auth_types:
                 raise BadInputException("Unhandled auth type: {}".format(auth_type))
 
-            headers = {
-                "User-Agent": self._user_agent,
-                "Authorization": f"Bearer {self._oauth2_access_token}",
-            }
+            headers = {"User-Agent": self._user_agent}
 
             if self._headers:
                 headers.update(self._headers)
 
+            if extra_headers:
+                headers.update(extra_headers)
+
+            # The SDK-managed auth header takes precedence over custom headers.
+            headers["Authorization"] = f"Bearer {self._oauth2_access_token}"
             headers["Content-Type"] = "application/octet-stream"
             headers["Dropbox-API-Arg"] = request_json_arg
             body = request_binary
@@ -170,6 +173,7 @@ class _DropboxSDK(Dropbox):
                 auth_type,
                 request_binary,
                 timeout,
+                extra_headers=extra_headers,
             )
 
 
